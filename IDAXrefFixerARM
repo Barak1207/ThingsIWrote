@@ -1,0 +1,232 @@
+import re
+import idc
+import idaapi
+import idautils
+
+class XrefFixerConfig( object ):
+
+    PLUGIN_NAME             = "Fix Missing ARM Xref"
+    PLUGIN_COMMENT          = "Fix Missing Xrefs when an ARM compiler loads a 32bit address into a register by splitting the addres."
+    PLUGIN_HOTKEY           = "Shift-X"
+    PLUGIN_HELP             = "Highlight desired address, press the hotkey, use IDA's xref function (usually CTRL+X)"
+    #CHOOSER_TITLE           = "FixMissingARMXref"
+    PLUGIN_TEST             = False
+
+# ------------------------------------------------------------------------------
+class XrefFixer():
+    DEBUG = 0
+    #Just some constants
+    INSTRUCTION_SIZE = 4#4 bytes per instruction in ARM.
+    MOV = 'MOV'
+    MOVW = 'MOVW'
+    MOVT = 'MOVT'
+
+    MNEM = 'MNEM'
+    REGISTER = 'REGISTER'
+    IMMEDIATE = 'IMMEDIATE'
+
+    TOLERANCE = 6#Search for a maxmium of TOLERANCE(e.g. 10) instructions between the different MOV instructions.
+
+    #Regex searches for MOV or MOVT instructions that specfically move a [1,4] digit immediate into a general purpose register(R0-R10)
+    #I didn't use all registers to try and reduce false positives.
+    #regex explained: <start line> 'MOV' or 'MOVT' 'white spaces' 'R[0-10]' ',' 'white space' '#' '0x'[1,4 digits immediate] <end line>
+    #REGEX = re.compile(r'^(MOVT?W?)\s+(R[0-9]0?),\s\#0x([0-9a-f]{1,4})$', flags=re.IGNORECASE)
+    #**I ended up using a regex that just searches for MOV/W?/T instructions that move and immediate value.**
+    REGEX = re.compile(r'^(MOVT?W?)\s+.+,\s\#0x([0-9a-f]{1,4})$', flags=re.IGNORECASE)#More general regex to catch cases where IDA decided that R0 will be called kobj and such...
+
+    def __init__(self):
+        self.all_mov_instructions = {}#Dict with All mov immediate to register instructions in all exectuable segments by their address
+        #{ea: {mne, register, immediate_value}, ...}
+
+    def get_xrefs_to_immediate(self, immediate, tolerance=10):#Called by user when submitting form
+        #immediate is an int
+        if not self.all_mov_instructions:#if dict is empty, need to fill
+            self.all_mov_instructions = self.get_all_mov_instructions_in_all_exectuable_segments()
+        #self.all_mov_instructions is now a Dict with All mov immediate to register instructions in all exectuable segments by their address
+        #{ea: {mne, register, immediate_value}, ...}
+        return self.search_xref_in_instructions(immediate, self.all_mov_instructions, tolerance)
+
+    def get_all_mov_instructions_in_all_exectuable_segments(self):
+        #This takes a few seconds to run, will only be used once in each IDA session.
+        res = {}
+        for segment_tuple in self.get_code_segments():
+            res.update(self.all_mov_in_range(segment_tuple[0], segment_tuple[1]))
+        return res#return list of all mov/w/t instruction that move an immediate into a register.
+
+    def get_code_segments(self):
+        #return a list of tuples of executable segments [(.text_start, .text_end), (.LOAD_start, LOAD_end), ...]
+        SEGPERM_R = 4
+        SEGPERM_W = 2
+        SEGPERM_X = 1
+        executable_segments = []
+        for ea in idautils.Segments():
+            #segname = idc.SegName(ea)
+            seg_perms = idc.GetSegmentAttr(ea, idc.SEGATTR_PERM)
+            if seg_perms & SEGPERM_X:#If segment is executable
+                seg_start = ea
+                seg_end = idc.GetSegmentAttr(ea, idc.SEGATTR_END)
+                executable_segments.append((seg_start, seg_end))
+        return executable_segments
+
+    def all_mov_in_range(self, start, end, size=0, offset=0):
+        #start=start ea, end=end ea, size=how many instructions iterate on, offset=offset from start ea
+
+        #Searches for all instructions in which an immediate is moved into a register and
+        #returns a dictionary such as {ea: disasm(ea), ea:disasm(ea), ...}
+        #returns a dictionary of dictionaries {ea: {mne, register, immediate_value}, ...}
+        dict_eas_mov = {}
+        count = 0   
+        for addr in Heads(start + (offset*XrefFixer.INSTRUCTION_SIZE), end):
+            #Iterate over all addreses in the chunk
+            if size != 0 and count >= size:
+                break       
+            count += 1
+
+            disasm = idc.GetDisasm(addr)
+            match = re.match(XrefFixer.REGEX, disasm)#match mov/movw/movt register, immediate instructions
+            if match:
+                register_num = GetOperandValue(addr, 0)#Get register number, will return 2 if R2 is used...
+                if register_num <= 10:#Only search for general purpose registers, R0-R10
+                    instruction_dict = {XrefFixer.MNEM: GetMnem(addr), XrefFixer.REGISTER: 'R'+str(register_num), XrefFixer.IMMEDIATE:GetOperandValue(addr, 1)}#Construct a dict, {'MNEM':'MOVT', 'REGISTER': 'R0', 'IMMEDIATE': 0xcafe}
+                    dict_eas_mov[addr] = instruction_dict
+
+        return dict_eas_mov
+        #NOTE:
+        #I tried using IDAAPI built in search text function but it was way to iffy and unreliable, Python's regex is better.
+        #And I suspect that the built in searc text/binary function will iterate over all the instructiosn anyway..
+
+    def search_xref_in_instructions(self, immediate, mov_instructions, tolerance=10):
+        #immediate=int to search xrefs to, mov_instructions=dictionary of MOV instructions and their addresses, tolerance=maxium gap OF INSTRUCTIONS to look for between the mov higher_bytes instruction and mov lower_bytes instruction.
+
+        #Search for instructions that load the immediate by splitting it.
+        #Return address list of these instructions.
+        xrefs = []
+        
+        higher_bytes = immediate >> 16 #immediate[0:4]
+        lower_bytes = immediate & 0x0000FFFF #immediate[4:8]
+        #print 'Higher_bytes: ' + hex(higher_bytes)
+        #print 'Lower_bytes: ' + hex(lower_bytes)
+        
+        count = 0
+        found_higher_bytes = False#Used as flag and as address...
+        found_higher_bytes_register = False
+        found_lower_bytes = False
+        found_lower_bytes_register = False#Used as flag and as register name...
+
+        addresses = sorted(mov_instructions.keys())#have to iterate on addresses in a ascending order
+        #TODO: Make sure both addresses are in the same function...maybe
+        for i, ea in enumerate(addresses):#The premise is that, the program movs the address by splitting it,the two mov instructions should be pretty close to one another...
+            instruction_dict = mov_instructions[ea]
+
+            mnem = instruction_dict[XrefFixer.MNEM]
+            register = instruction_dict[XrefFixer.REGISTER]
+            imm = instruction_dict[XrefFixer.IMMEDIATE]
+
+            #inst_str = hex(ea)[:-1] + ' : ' + mnem + ' ' + register + ' ' + hex(imm)[:-1]#Used for debugging
+
+            if higher_bytes == imm and mnem == XrefFixer.MOVT:#Reduce flase positives, make sure higher bytes are loaded using MOVT
+                if found_higher_bytes:#Found again before finding found_lower_bytes, need to reset counter      
+                    count = 0
+                found_higher_bytes = ea
+                found_higher_bytes_register = register
+                #print 'Found higher_bytes at ' + inst_str
+            elif lower_bytes == imm and (mnem == XrefFixer.MOV or mnem == XrefFixer.MOVW):#Make sure lower bytes are loaded using MOV or MOVW
+                if found_lower_bytes:#Found again before finding found_higher_bytes, need to reset counter      
+                    count = 0
+                found_lower_bytes = ea
+                found_lower_bytes_register = register
+                #print 'Found lower_bytes at ' + inst_str
+            
+            #If found instruction that moves higher bytes and found instruction that moves lower bytes bytes and they both used the same register and the gap between their addresses is smaller than tolerance:
+            if found_higher_bytes and found_lower_bytes and found_higher_bytes_register == found_lower_bytes_register and abs(found_higher_bytes - found_lower_bytes) < tolerance*XrefFixer.INSTRUCTION_SIZE:
+
+                bigger_addr = max(found_higher_bytes, found_lower_bytes)#Which instruction comes second
+                #smaller_addr = min(found_higher_bytes, found_lower_bytes)#Used for debugging           
+                #print 'Found both, gap: ' + str((bigger_addr - smaller_addr)/XrefFixer.INSTRUCTION_SIZE) + ', tolerance is: ' + str(tolerance)
+                #print 'LOWER************' + hex(smaller_addr)[:-1] + ' ' + found_lower_bytes_register + '************'
+                #print 'HIGHER************' + hex(bigger_addr)[:-1] + ' ' + found_higher_bytes_register + '************'
+                xrefs.append(bigger_addr)#Append the higher address of the two
+                #Reset
+                count = 0
+                found_higher_bytes = False
+                found_lower_bytes = False
+                found_higher_bytes_register = False
+                found_lower_bytes_register = False          
+            
+            count += 1
+            if count >= tolerance:#Too many instructions gap before getting a hit, reset.
+                #Reset
+                count = 0
+                found_higher_bytes = False
+                found_lower_bytes = False
+                found_higher_bytes_register = False
+                found_lower_bytes_register = False
+                continue
+
+        return xrefs
+
+class XrefFixerPlugin( idaapi.plugin_t ):
+
+    flags            = 0
+    comment          = XrefFixerConfig.PLUGIN_COMMENT
+    help             = XrefFixerConfig.PLUGIN_HELP
+    wanted_name      = XrefFixerConfig.PLUGIN_NAME
+    wanted_hotkey    = XrefFixerConfig.PLUGIN_HOTKEY
+    #Type, max_char_count, width    
+    form_string      = """ARMXrefFixer
+Search ARM split MOV Xrefs
+
+<En~T~er tolerance gap between instructions :N:5:5::>
+<~E~nter 8 byte address in hex (e.g. 0xCAFECAFE) :N:10:10::>
+
+Note: Increasing the tolerance will increase false positives...
+Note: First execution in a new IDA session will take a few seconds...
+"""
+
+    def __init__(self, *args, **kwargs):#Called from PLUGIN_ENTRY        
+        super(XrefFixerPlugin, self).__init__(*args, **kwargs)
+
+
+    def init(self):#Called from __init__
+        self.xreffixer = XrefFixer()
+        return idaapi.PLUGIN_KEEP        
+
+    def run(self, arg=0):#When HOTKEY is pressed
+
+        current_value = idc.ScreenEA()#Get current EA to try and guess the desired address and autofill the form with it
+        if not (current_value and current_value != idc.BADADDR):
+            current_value = 0
+
+        #idaapi Form vodoo...
+        num_arg = Form.NumericArgument('N', value=current_value)
+        tolerance_arg = Form.NumericArgument('N', value=XrefFixer.TOLERANCE)
+        
+        ok = idaapi.AskUsingForm(XrefFixerPlugin.form_string, tolerance_arg.arg, num_arg.arg)
+        if ok == 1:#Form is ok
+
+            answer_address = num_arg.value#Address to search xrefs to
+            tolerance = tolerance_arg.value#Tolerance
+
+            if tolerance <= 0:
+                print 'Invalid tolerance, using default: ' + str(XrefFixer.TOLERANCE)
+                tolerance = XrefFixer.TOLERANCE#
+
+            xrefs_to_address =  self.xreffixer.get_xrefs_to_immediate(answer_address, tolerance=tolerance)#Get xrefs to that address.
+            if len(xrefs_to_address) > 0:
+                for addr in xrefs_to_address:
+                    add_dref(addr, answer_address, idc.ida_xref.XREF_DATA | idc.ida_xref.dr_R)#Add data xref to IDA
+
+        return
+
+    def term( self ):
+        return
+
+
+# ------------------------------------------------------------------------------    
+
+
+def PLUGIN_ENTRY():#When IDA is loaded
+    return XrefFixerPlugin()
+
+
+# ------------------------------------------------------------------------------
