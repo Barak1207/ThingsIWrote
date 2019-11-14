@@ -1,4 +1,4 @@
-# UsefulThingsIWrote
+# ThingsIWrote
 Some things I wrote and don't know where to save them...
 
 RaspberryPILCD - A python module for handling LCD screens for Raspberry pi (supports multihtreaded writes to LCD)
